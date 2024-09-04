@@ -35,6 +35,7 @@ class PairTradingAnalyzer(DataAnalyzer):
     def __init__(self, data):
         super().__init__(data)
         self.regression_results = {}
+        self.pair_metrics = {}
 
     def check_stationarity(self, series):
         adf_test = self.perform_adfuller(series)
@@ -80,22 +81,45 @@ class PairTradingAnalyzer(DataAnalyzer):
 
         return selected_pairs
     
-    def store_pair_metrics(self, pairs):
+    # def store_pair_metrics(self, pairs):
+    #     self.pair_metrics = {}
+    #     for ticker1, ticker2, score, p_value in pairs:
+    #         if self.analyze_pair(ticker1, ticker2):
+    #             ols_result = self.regression_results[(ticker1, ticker2)]
+    #             residuals = ols_result.resid
+    #             adf_test = self.perform_adfuller(residuals)
+    #             beta = ols_result.params[1]
+    #             half_life = np.round(-np.log(2) / np.log(acf(self.normaliza_zscore(residuals).dropna(), alpha=0.05, nlags=1)[0][1]), 2)
+    #             correlation = self.data[ticker1].corr(self.data[ticker2])
+    #             self.pair_metrics[(ticker1, ticker2)] = {
+    #                 "score": score,
+    #                 "p_value": p_value,
+    #                 "adf_p_value": adf_test[1],
+    #                 "beta": beta,
+    #                 "half_life": half_life,
+    #                 "correlation": correlation
+    #             } 
+
+    def calculate_and_store_pair_metrics(self, pairs):
         self.pair_metrics = {}
         for ticker1, ticker2, score, p_value in pairs:
-            if self.analyze_pair(ticker1, ticker2):
-                ols_result = self.regression_results[(ticker1, ticker2)]
-                residuals = ols_result.resid
-                adf_test = self.perform_adfuller(residuals)
-                beta = ols_result.params[1]
-                half_life = np.round(-np.log(2) / np.log(acf(self.normaliza_zscore(residuals).dropna(), alpha=0.05, nlags=1)[0][1]), 2)
-                correlation = self.data[ticker1].corr(self.data[ticker2])
-                self.pair_metrics[(ticker1, ticker2)] = {
-                    "score": score,
-                    "p_value": p_value,
-                    "adf_p_value": adf_test[1],
-                    "beta": beta,
-                    "half_life": half_life,
-                    "correlation": correlation
-
-                } 
+            y = self.data[ticker1]
+            X = sm.add_constant(self.data[ticker2])
+            model = sm.OLS(y, X).fit()
+            residuals = model.resid
+            
+            adf_test = adfuller(residuals)
+            half_life = np.round(-np.log(2) / np.log(acf(residuals, nlags=1)[1]), 2)
+            
+            self.pair_metrics[(ticker1, ticker2)] = {
+                "score": score,
+                "p_value": p_value,
+                "adf_p_value": adf_test[1],
+                "beta": model.params[1],
+                "alpha": model.params[0],
+                "residuals_mean": residuals.mean(),
+                "residuals_std": residuals.std(),
+                "half_life": half_life
+            }
+        
+        return self.pair_metrics

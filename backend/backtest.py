@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from scipy import stats
+import statsmodels.api as sm
 
 class BacktestAnalyzer:
     def __init__(self, data, trading_analyzer):
@@ -35,10 +36,11 @@ class BacktestAnalyzer:
         data_slice = self.data.loc[start_date:end_date]
         
         self.trading_analyzer.data = data_slice
-        selected_pairs = self.trading_analyzer.test_cointegrated_pairs(data_slice.columns)
-        stationary_pairs = self.trading_analyzer.find_stationary_pairs(selected_pairs)
+        cointegrated_pairs = self.trading_analyzer.test_cointegrated_pairs(data_slice.columns)
+        stationary_pairs = self.trading_analyzer.find_stationary_pairs(cointegrated_pairs)
+        pair_metrics = self.trading_analyzer.calculate_and_store_pair_metrics(stationary_pairs)
         
-        self.bimonthly_analyses[current_date.strftime('%Y-%m')] = stationary_pairs
+        self.bimonthly_analyses[current_date.strftime('%Y-%m')] = pair_metrics
 
     def _check_signals(self, current_date):
         bimonthly_key = (current_date.replace(day=1) - pd.offsets.MonthBegin(1)).strftime('%Y-%m')
@@ -52,14 +54,21 @@ class BacktestAnalyzer:
             self._check_pair_signals(current_date, ticker1, ticker2, (ticker1, ticker2) in current_pairs)
 
     def _check_pair_signals(self, current_date, ticker1, ticker2, is_current):
-        # Calcular o z-score para o dia atual
-        lookback = 30  # Período para calcular o z-score
-        end_date = current_date
-        start_date = end_date - pd.Timedelta(days=lookback)
+        if current_date not in self.data.index:
+            print(f"Data {current_date} não encontrada no conjunto de dados. Pulando...")
+            return
+        bimonthly_key = (current_date.replace(day=1) - pd.offsets.MonthBegin(1)).strftime('%Y-%m')
+        pair_metrics = self.bimonthly_analyses.get(bimonthly_key, {}).get((ticker1, ticker2))
         
-        data_slice = self.data.loc[start_date:end_date, [ticker1, ticker2]]
-        spread = data_slice[ticker1] - data_slice[ticker2]
-        zscore = (spread.iloc[-1] - spread.mean()) / spread.std()
+        if not pair_metrics:
+            return
+        
+        y = self.data.loc[current_date, ticker1]
+        x = self.data.loc[current_date, ticker2]
+        
+        # Usar as métricas calculadas na análise bimestral
+        residual = y - (pair_metrics['alpha'] + pair_metrics['beta'] * x)
+        zscore = (residual - pair_metrics['residuals_mean']) / pair_metrics['residuals_std']
 
         position_key = (ticker1, ticker2)
         position = self.position_status.get(position_key)
@@ -95,7 +104,6 @@ class BacktestAnalyzer:
         df = pd.DataFrame(self.backtest_results)
         df = df.pivot(index='date', columns='pair', values=['zscore', 'entry', 'maintain', 'exit'])
         df.columns = [f"{col[1]}_{col[0]}" for col in df.columns]
-        print(df)
         
         # Salvar o DataFrame em um arquivo CSV
         csv_filename = 'backtest_results.csv'
