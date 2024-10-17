@@ -165,12 +165,13 @@ df_daily_statistics['trade_return'] = np.nan  # Retorno financeiro
 # Flag para controlar se uma operação está aberta
 trade_open = False
 entry_day = None  # Dia de entrada na operação
+last_residual = None  # Armazenar o último resíduo para monitorar o cruzamento do zero
 
 # Iterar sobre o DataFrame para identificar os dias de trading e calcular as quantidades e retorno
 for i in range(len(df_daily_statistics)):
     row = df_daily_statistics.iloc[i]
 
-    # Verificar se o sinal de trading está ativo e não há operação aberta
+    # Verificar se o sinal de trading está ativo, o beta é positivo e não há operação aberta
     if row['trade_signal'] == 1 and row['beta'] > 0 and not trade_open:
         # Calcular a quantidade de ações com base no preço e beta
         qty_long, qty_short = calculate_trade_volumes(row['price_ticker1'], row['price_ticker2'], row['beta'], total_investment)
@@ -182,30 +183,39 @@ for i in range(len(df_daily_statistics)):
         # Marcar que a operação foi aberta
         trade_open = True
         entry_day = i  # Armazenar o índice do dia de entrada
+        last_residual = row['residual']  # Registrar o resíduo de entrada
 
-    # Verificar se o resíduo voltou para 0 (ou próximo de 0) e uma operação está aberta
-    elif trade_open and abs(row['residual']) < 0.1:  # Faixa próxima de 0 para fechar a operação
-        # Recuperar os preços e quantidades da entrada da operação
-        entry_price_long = df_daily_statistics.at[entry_day, 'price_ticker1']
-        entry_price_short = df_daily_statistics.at[entry_day, 'price_ticker2']
-        qty_long = df_daily_statistics.at[entry_day, 'qty_ticker1']
-        qty_short = df_daily_statistics.at[entry_day, 'qty_ticker2']
+    # Se uma operação estiver aberta, verificar o cruzamento do zero
+    elif trade_open:
+        current_residual = row['residual']
 
-        # Calcular o retorno financeiro com base nos preços de entrada e saída
-        trade_return = calculate_return(
-            entry_price_long, row['price_ticker1'], qty_long,  # Preços e quantidades do long
-            entry_price_short, row['price_ticker2'], qty_short  # Preços e quantidades do short
-        )
+        # Se o resíduo cruzar o zero, fechar a operação
+        if (last_residual > 0 and current_residual < 0) or (last_residual < 0 and current_residual > 0):
+            # Recuperar os preços e quantidades da entrada da operação
+            entry_price_long = df_daily_statistics.at[entry_day, 'price_ticker1']
+            entry_price_short = df_daily_statistics.at[entry_day, 'price_ticker2']
+            qty_long = df_daily_statistics.at[entry_day, 'qty_ticker1']
+            qty_short = df_daily_statistics.at[entry_day, 'qty_ticker2']
 
-        # Registrar o retorno no dia de fechamento da operação
-        df_daily_statistics.at[i, 'trade_return'] = trade_return
-        
-        # Marcar que a operação foi fechada
-        trade_open = False
-        entry_day = None  # Resetar o dia de entrada
+            # Calcular o retorno financeiro com base nos preços de entrada e saída
+            trade_return = calculate_return(
+                entry_price_long, row['price_ticker1'], qty_long,  # Preços e quantidades do long
+                entry_price_short, row['price_ticker2'], qty_short  # Preços e quantidades do short
+            )
+
+            # Registrar o retorno no dia de fechamento da operação
+            df_daily_statistics.at[i, 'trade_return'] = trade_return
+
+            # Marcar que a operação foi fechada
+            trade_open = False
+            entry_day = None  # Resetar o dia de entrada
+
+        # Atualizar o último resíduo
+        last_residual = current_residual
 
 # Exibir os resultados
 print(df_daily_statistics[['date', 'ticker1', 'ticker2', 'price_ticker1', 'price_ticker2', 'qty_ticker1', 'qty_ticker2', 'trade_return']])
+
 
 
 # Salvar os resultados em CSV se houver resultados
