@@ -2,253 +2,216 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
-from statsmodels.tsa.stattools import adfuller, coint, acf
-from statsmodels.stats.diagnostic import het_breuschpagan
-from statsmodels.stats.stattools import durbin_watson
+from statsmodels.regression.rolling import RollingOLS
+from joblib import Parallel, delayed
 
 # Função para coletar os dados dos ativos
 def fetch_data(tickers, start_date, end_date):
     data = yf.download(tickers, start=start_date, end=end_date)['Adj Close']
-    all_dates = pd.date_range(start=start_date, end=end_date, freq='B')  # Garantir que todas as datas úteis estejam presentes
-    data = data.reindex(all_dates).interpolate()  # Reindexar para incluir todas as datas e interpolar valores faltantes
+    all_dates = pd.date_range(start=start_date, end=end_date, freq='B')
+    data = data.reindex(all_dates).interpolate()
     return data
 
-def test_stationarity(series):
-    adf_result = adfuller(series)
-    return adf_result  # P-value
+def rolling_ols_stats(df, window_size=120):
+    df['beta'] = np.nan
+    df['residual'] = np.nan
 
-# Função para calcular as métricas estatísticas para um par de ativos
-def calculate_statistics(series1, series2):
-    # Teste de cointegração
-    coint_result = coint(series1, series2)
-    p_value_coint = coint_result[1]
-    coint_score = coint_result[0] < coint_result[2][1] and p_value_coint < 0.01 
+    for _, pair in df[['ticker1', 'ticker2']].drop_duplicates().iterrows():
+        ticker1 = pair['ticker1']
+        ticker2 = pair['ticker2']
 
-    # Regressão OLS
-    X = sm.add_constant(series2)
-    ols_result = sm.OLS(series1, X).fit()
-    alpha, beta = ols_result.params
-    residuals = ols_result.resid
+        # Filtrar os dados para o par específico
+        pair_data = df[(df['ticker1'] == ticker1) & (df['ticker2'] == ticker2)].copy()
+        pair_data = pair_data.sort_values('date')
 
-    # Teste de Estacionariedade
-    adf_result = test_stationarity(residuals)
-    p_value_adf = adf_result[1]
-    adf_score = adf_result[0] <= adf_result[4]['5%'] and p_value_adf < 0.01
-    
-    # Teste de Estacionariedade nas Séries Individuais
-    adf_series1 = test_stationarity(series1)
-    adf_series2 = test_stationarity(series2)
+        # Regressão OLS móvel (rolling)
+        exog = sm.add_constant(pair_data['price_ticker2'])
+        endog = pair_data['price_ticker1']
+        rolling_model = RollingOLS(endog=endog, exog=exog, window=window_size)
+        rolling_results = rolling_model.fit()
 
-    # Teste de Heterocedasticidade (Breusch-Pagan)
-    lm_stat, lm_pvalue, fvalue, f_pvalue = het_breuschpagan(residuals, X)
+        # Obter os parâmetros estimados (intercepto e beta)
+        params = rolling_results.params
 
-    # Teste de Autocorrelação dos Resíduos (Durbin-Watson)
-    dw_stat = durbin_watson(residuals)
+        # Calculando manualmente os valores previstos: intercepto + beta * exog
+        predicted_values = params['const'] + params['price_ticker2'] * pair_data['price_ticker2']
 
-    # Cálculos dos resíduos
-    residuals_normalized = (residuals - np.mean(residuals)) / np.std(residuals)
-    last_residual_normalized = residuals_normalized.iloc[-1]
+        # Calculando os resíduos (residuals)
+        residuals = endog - predicted_values
 
-    # Half-life dos resíduos
-    try:
-        half_life = np.round(-np.log(2) / np.log(acf(last_residual_normalized, alpha=0.05, nlags=1)[0][1]), 2)
-    except:
-        half_life = np.nan
+        # Atualizando o DataFrame com os betas e os resíduos
+        df.loc[(df['ticker1'] == ticker1) & (df['ticker2'] == ticker2), 'beta'] = params['price_ticker2']
+        df.loc[(df['ticker1'] == ticker1) & (df['ticker2'] == ticker2), 'residual'] = residuals
 
-    return {
-        'score_coint': coint_score,
-        'p_value': p_value_coint,
-        'score_adf': adf_score,
-        'P_value_adf': p_value_adf,
-        'residual': last_residual_normalized,
-        'beta': beta,
-        'half_life': half_life,
-        'breusch': lm_pvalue
-    }
+    return df
 
-# Função para verificar as condições de trading
-def check_trading_conditions(row):
-    # Definir as condições para o trading
-    coint_condition = row['score_coint']  # Cointegração dos ativos
-    adf_condition = row['score_adf']  # Estacionariedade dos resíduos 
-    residual_condition = abs(row['residual']) > 1.5  # Resíduo normalizado fora da faixa [-1.5, 1.5]
-    autocorrelation_condition = row['breusch']  < 0.05
+# Função para verificar as condições de entrada dinâmicas com base na volatilidade
+def dynamic_entry_exit_conditions(row, residual_volatility, k_factor=1.5):
+    residual_condition = abs(row['residual']) > k_factor * residual_volatility
+    return residual_condition
 
-    # Se todas as condições forem atendidas, marcar como OK para trading
-    if coint_condition and adf_condition and residual_condition and autocorrelation_condition:
-        return 1  # Sinal de trading "OK"
-    else:
-        return 0  # Não é um bom dia para trading
+# Função para aplicar as condições dinâmicas de trading
+def check_dynamic_trading_conditions(df, window_size=60, k_factor=1.5):
+    for _, pair in df[['ticker1', 'ticker2']].drop_duplicates().iterrows():
+        ticker1 = pair['ticker1']
+        ticker2 = pair['ticker2']
 
-# Função para calcular a quantidade de ações compradas e vendidas
-def calculate_trade_volumes(price_long, price_short, beta, total_investment):
-    investment_per_asset = total_investment / 2
-    qty_long = investment_per_asset / price_long
-    qty_short = (investment_per_asset * beta) / price_short
-    return qty_long, qty_short
+        pair_data = df[(df['ticker1'] == ticker1) & (df['ticker2'] == ticker2)].copy()
+        pair_data = pair_data.sort_values('date')
 
-# Função para calcular o retorno financeiro
-def calculate_return(entry_price_long, exit_price_long, qty_long, entry_price_short, exit_price_short, qty_short):
-    # Retorno no ativo long
-    long_return = (exit_price_long - entry_price_long) * qty_long
-    # Retorno no ativo short (note que você ganha quando o preço cai)
-    short_return = (entry_price_short - exit_price_short) * qty_short
-    # Retorno total
-    return long_return + short_return
+        pair_data['residual_volatility'] = pair_data['residual'].rolling(window=window_size).std()
+
+        for i, row in pair_data.iterrows():
+            if not np.isnan(row['residual_volatility']):
+                df.loc[i, 'trade_signal'] = dynamic_entry_exit_conditions(row, row['residual_volatility'], k_factor=k_factor)
+
+    return df
 
 # Função principal para rodar os cálculos diariamente
-def run_daily_backtest(tickers, start_date, end_date, window_size, start_calc_day):
+def run_daily_backtest_parallel(tickers, start_date, end_date, window_size, pairs=None):
     data = fetch_data(tickers, start_date, end_date)
+
+    if pairs is None:
+        raise ValueError("Nenhuma lista de pares fornecida.")
+    else:
+        tickers_in_pairs = set([t for pair in pairs for t in pair])
+        missing_tickers = tickers_in_pairs - set(data.columns)
+        if missing_tickers:
+            raise ValueError(f"Tickers não encontrados nos dados: {missing_tickers}")
+
     results = []
 
-    # Calcular a data de início após 90 dias úteis
-    calc_start_date = pd.to_datetime(start_date) + pd.offsets.BDay(start_calc_day)
+    # calc_start_date = pd.to_datetime(start_date) + pd.offsets.BDay(start_calc_day)
+    dates = data.index[data.index >= pd.to_datetime(start_date)]
 
-    for current_date in data.index:
-        # Apenas começar após 90 dias úteis
-        if current_date < calc_start_date:
-            continue
+    def process_date_pair(current_date, ticker_pair):
+        ticker1, ticker2 = ticker_pair
+        start_window = current_date - pd.offsets.BDay(window_size)
+        series1 = data[ticker1].loc[start_window:current_date].dropna()
+        series2 = data[ticker2].loc[start_window:current_date].dropna()
 
-        print(f"Processando data: {current_date}")
+        if len(series1) >= window_size and len(series2) >= window_size:
+            result = {
+                'date': current_date,
+                'ticker1': ticker1,
+                'ticker2': ticker2,
+                'price_ticker1': data[ticker1].loc[current_date],
+                'price_ticker2': data[ticker2].loc[current_date]
+            }
+            return result
+        else:
+            return None
 
-        for i in range(len(tickers)):
-            for j in range(i + 1, len(tickers)):
-                ticker1, ticker2 = tickers[i], tickers[j]
-
-                # Selecionar os últimos 60 dias úteis de dados para cada ativo
-                start_window = current_date - pd.offsets.BDay(window_size)
-                series1 = data[ticker1].loc[start_window:current_date].dropna()
-                series2 = data[ticker2].loc[start_window:current_date].dropna()
-
-                # Realizar os cálculos apenas se houver dados suficientes
-                if len(series1) >= window_size and len(series2) >= window_size:
-                    stats = calculate_statistics(series1, series2)
-
-                    result = {
-                        'date': current_date,
-                        'ticker1': ticker1,
-                        'ticker2': ticker2,
-                        'price_ticker1': data[ticker1].loc[current_date],
-                        'price_ticker2': data[ticker2].loc[current_date],
-                        **stats
-                    }
-
-                    results.append(result)
-                    print(f"Estatísticas calculadas para {ticker1} e {ticker2} na data {current_date}")
-                else:
-                    print(f"Dados insuficientes para {ticker1} e {ticker2} na data {current_date}")
+    for current_date in dates:
+        date_results = Parallel(n_jobs=-1)(
+            delayed(process_date_pair)(current_date, pair) for pair in pairs
+        )
+        date_results = [res for res in date_results if res is not None]
+        results.extend(date_results)
 
     df_results = pd.DataFrame(results)
     return df_results
 
+# Função para calcular a quantidade de ações compradas e vendidas com ajuste no beta
+def calculate_trade_volumes(price_long, price_short, beta, total_investment):
+    beta_adjusted = max(-2.0, min(beta, 2.0))
+
+    investment_per_asset = total_investment / 2
+    qty_long = investment_per_asset / price_long
+    qty_short = (investment_per_asset * beta_adjusted) / price_short
+    return qty_long, qty_short
+
+# Função para calcular o retorno financeiro
+def calculate_return(entry_price_long, current_price_long, qty_long, entry_price_short, current_price_short, qty_short):
+    long_return = (current_price_long - entry_price_long) * qty_long
+    short_return = (entry_price_short - current_price_short) * qty_short
+    return long_return + short_return
+
+# Função para aplicar as operações e calcular os retornos financeiros
+def apply_trading(df, total_investment=10000):
+    open_trades = {}
+
+    df['qty_ticker1'] = np.nan
+    df['qty_ticker2'] = np.nan
+    df['trade_return'] = np.nan
+    df['daily_trade_return'] = 0.0
+
+    pairs_df = df[['ticker1', 'ticker2']].drop_duplicates()
+
+    for _, pair in pairs_df.iterrows():
+        ticker1 = pair['ticker1']
+        ticker2 = pair['ticker2']
+        pair_data = df[(df['ticker1'] == ticker1) & (df['ticker2'] == ticker2)].copy().sort_values('date').reset_index(drop=True)
+
+        for i in range(len(pair_data)):
+            row = pair_data.iloc[i]
+            current_date = row['date']
+            idx = df[(df['date'] == current_date) & (df['ticker1'] == ticker1) & (df['ticker2'] == ticker2)].index
+
+            trade_info = open_trades.get((ticker1, ticker2), None)
+
+            if trade_info is None and row['trade_signal'] == 1 and row['beta'] > 0:
+                qty_long, qty_short = calculate_trade_volumes(row['price_ticker1'], row['price_ticker2'], row['beta'], total_investment)
+                df.loc[idx, 'qty_ticker1'] = qty_long
+                df.loc[idx, 'qty_ticker2'] = qty_short
+
+                open_trades[(ticker1, ticker2)] = {
+                    'entry_price_long': row['price_ticker1'],
+                    'entry_price_short': row['price_ticker2'],
+                    'qty_long': qty_long,
+                    'qty_short': qty_short,
+                    'entry_residual': row['residual'],
+                    'entry_date': current_date
+                }
+            elif trade_info is not None:
+                current_price_long = row['price_ticker1']
+                current_price_short = row['price_ticker2']
+                unrealized_return = calculate_return(
+                    trade_info['entry_price_long'], current_price_long, trade_info['qty_long'],
+                    trade_info['entry_price_short'], current_price_short, trade_info['qty_short']
+                )
+                df.loc[idx, 'daily_trade_return'] = unrealized_return
+
+                if trade_info['entry_residual'] * row['residual'] < 0:
+                    df.loc[idx, 'trade_return'] = unrealized_return
+                    del open_trades[(ticker1, ticker2)]
+            else:
+                df.loc[idx, 'daily_trade_return'] = 0.0
+
+    return df
+
 # Código principal
 tickers_list = [
-    'ABEV3.SA', 'BBSE3.SA', 'BPAC11.SA', 'BRFS3.SA', 'BBDC4.SA',
-    'ELET3.SA', 'EQTL3.SA', 'GGBR4.SA', 'PETR3.SA', 'PETR4.SA',
-    'PRIO3.SA', 'RAIL3.SA', 'RADL3.SA', 'RENT3.SA', 'SUZB3.SA',
-    'UGPA3.SA', 'VALE3.SA', 'VIVT3.SA'
+    'ABEV3.SA', 'B3SA3.SA', 'BBAS3.SA', 'BBDC4.SA', 'BBSE3.SA', 'BPAC11.SA', 'CMIG4.SA', 'ELET3.SA',
+    'EMBR3.SA', 'ENEV3.SA', 'EQTL3.SA', 'ITUB4.SA', 'PRIO3.SA', 'RADL3.SA', 'RAIL3.SA', 'RDOR3.SA',
+    'SUZB3.SA', 'BRFS3.SA', 'GGBR4.SA', 'RENT3.SA', 'VALE3.SA', 'PETR3.SA', 'WEGE3.SA', 'SBSP3.SA',
+    'JBSS3.SA', 'VBBR3.SA', 'PETR4.SA'
 ]
 
+pairs = [
+    ('B3SA3.SA', 'BBDC4.SA'), ('B3SA3.SA', 'RENT3.SA'), ('BBAS3.SA', 'EQTL3.SA'),
+    ('BBAS3.SA', 'PETR3.SA'), ('BBAS3.SA', 'PETR4.SA'), ('BBDC4.SA', 'ENEV3.SA'),
+    ('BBSE3.SA', 'PRIO3.SA'), ('BPAC11.SA', 'RADL3.SA'), ('BPAC11.SA', 'RAIL3.SA'),
+    ('ENEV3.SA', 'PRIO3.SA'), ('ENEV3.SA', 'RDOR3.SA'), ('EQTL3.SA', 'PRIO3.SA'),
+    ('RADL3.SA', 'RAIL3.SA')
+]
 
-start_date = "2021-01-01"
+start_date = "2019-01-01"
 end_date = "2024-09-30"
 
-# Executar a função de backtest
-df_daily_statistics = run_daily_backtest(tickers_list, start_date, end_date, window_size=60, start_calc_day=120)
+# Passo 1: Executar a função de backtest
+df_daily_statistics = run_daily_backtest_parallel(
+    tickers_list, start_date, end_date, window_size=120, pairs=pairs
+)
 
-# Aplicar a função ao DataFrame
-df_daily_statistics['trade_signal'] = df_daily_statistics.apply(check_trading_conditions, axis=1)
+# Passo 2: Calcular estatísticas usando Rolling OLS
+df_daily_statistics = rolling_ols_stats(df_daily_statistics, window_size=120)
 
-# Definir o total a ser investido em cada operação
-total_investment = 10000  # Exemplo de R$10.000 para cada par
+# Passo 3: Definir condições dinâmicas de entrada/saída com volatilidade ajustada
+df_daily_statistics = check_dynamic_trading_conditions(df_daily_statistics, window_size=60, k_factor=1.5)
 
-# Inicializar colunas para quantidade de ações e retorno
-df_daily_statistics['qty_ticker1'] = np.nan  # Quantidade de ações compradas (long)
-df_daily_statistics['qty_ticker2'] = np.nan  # Quantidade de ações vendidas (short)
-df_daily_statistics['trade_return'] = np.nan  # Retorno financeiro
-
-# Iterar sobre cada par separadamente
-pairs = df_daily_statistics[['ticker1', 'ticker2']].drop_duplicates()
-
-for _, pair in pairs.iterrows():
-    ticker1 = pair['ticker1']
-    ticker2 = pair['ticker2']
-    pair_data = df_daily_statistics[(df_daily_statistics['ticker1'] == ticker1) & (df_daily_statistics['ticker2'] == ticker2)].copy()
-    pair_data = pair_data.sort_values('date').reset_index(drop=True)
-
-    trade_open = False
-    entry_row = None  # Linha de entrada na operação
-    entry_residual = None  # Resíduo no momento da entrada
-
-    for i in range(len(pair_data)):
-        row = pair_data.iloc[i]
-
-        # Verificar se o sinal de trading está ativo, o beta é positivo e não há operação aberta
-        if row['trade_signal'] == 1 and row['beta'] > 0 and not trade_open:
-            # Calcular a quantidade de ações com base no preço e beta
-            qty_long, qty_short = calculate_trade_volumes(row['price_ticker1'], row['price_ticker2'], row['beta'], total_investment)
-
-            # Registrar as quantidades no DataFrame principal
-            idx = df_daily_statistics[(df_daily_statistics['date'] == row['date']) &
-                                      (df_daily_statistics['ticker1'] == ticker1) &
-                                      (df_daily_statistics['ticker2'] == ticker2)].index
-            if len(idx) == 1:
-                df_daily_statistics.loc[idx, 'qty_ticker1'] = qty_long
-                df_daily_statistics.loc[idx, 'qty_ticker2'] = qty_short
-            else:
-                print(f"Alerta: Mais de um índice encontrado para {ticker1} e {ticker2} na data {row['date']}")
-
-            # Marcar que a operação foi aberta
-            trade_open = True
-            entry_row = row  # Armazenar a linha de entrada
-            entry_residual = row['residual']  # Registrar o resíduo de entrada
-
-            # Armazenar as quantidades e preços de entrada
-            entry_qty_long = qty_long
-            entry_qty_short = qty_short
-            entry_price_long = row['price_ticker1']
-            entry_price_short = row['price_ticker2']
-
-            print(f"Operação aberta para {ticker1}/{ticker2} na data {row['date']}")
-            print(f"Resíduo de entrada: {entry_residual}")
-
-        # Se uma operação estiver aberta, verificar o cruzamento do zero em relação ao resíduo de entrada
-        elif trade_open:
-            current_residual = row['residual']
-
-            # Se o resíduo cruzar o zero em relação ao resíduo de entrada, fechar a operação
-            if entry_residual * current_residual < 0:
-                # Recuperar os preços de saída
-                exit_price_long = row['price_ticker1']
-                exit_price_short = row['price_ticker2']
-
-                # Calcular o retorno financeiro com base nos preços de entrada e saída
-                trade_return = calculate_return(
-                    entry_price_long, exit_price_long, entry_qty_long,
-                    entry_price_short, exit_price_short, entry_qty_short
-                )
-
-                # Registrar o retorno no dia de fechamento da operação
-                idx = df_daily_statistics[(df_daily_statistics['date'] == row['date']) &
-                                          (df_daily_statistics['ticker1'] == ticker1) &
-                                          (df_daily_statistics['ticker2'] == ticker2)].index
-                df_daily_statistics.loc[idx, 'trade_return'] = trade_return
-
-                # Marcar que a operação foi fechada
-                trade_open = False
-                entry_row = None  # Resetar a linha de entrada
-                entry_residual = None  # Resetar o resíduo de entrada
-
-                print(f"Operação fechada para {ticker1}/{ticker2} na data {row['date']}")
-                print(f"Quantidades: Long - {entry_qty_long}, Short - {entry_qty_short}")
-                print(f"Preços de entrada: Long - {entry_price_long}, Short - {entry_price_short}")
-                print(f"Preços de saída: Long - {exit_price_long}, Short - {exit_price_short}")
-                print(f"Retorno da operação: {trade_return}")
-
-            # Não atualizar o entry_residual; mantemos o resíduo de entrada para comparação
-
-# Exibir os resultados
-print(df_daily_statistics[['date', 'ticker1', 'ticker2', 'price_ticker1', 'price_ticker2', 'qty_ticker1', 'qty_ticker2', 'trade_return']])
+# Passo 4: Aplicar operações de trading e calcular os retornos financeiros
+df_daily_statistics = apply_trading(df_daily_statistics, total_investment=10000)
 
 # Salvar os resultados em CSV se houver resultados
 if not df_daily_statistics.empty:
