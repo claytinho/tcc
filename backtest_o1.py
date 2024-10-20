@@ -127,16 +127,22 @@ def calculate_return(entry_price_long, current_price_long, qty_long, entry_price
     short_return = (entry_price_short - current_price_short) * qty_short
     return long_return + short_return
 
-# Função para aplicar as operações e calcular os retornos financeiros
-def apply_trading(df, total_investment=10000):
+# (Os imports e funções anteriores permanecem inalterados)
+
+# Função para aplicar as operações e calcular os retornos financeiros com stop-loss e período de espera
+def apply_trading(df, total_investment=10000, stop_loss_percentage=0.05, cooldown_period=20):
     open_trades = {}
+    stop_loss_dates = {}  # Dicionário para rastrear a data do último stop-loss para cada par
 
     df['qty_ticker1'] = np.nan
     df['qty_ticker2'] = np.nan
     df['trade_return'] = np.nan
     df['daily_trade_return'] = 0.0
+    df['trade_close_reason'] = np.nan  # Coluna para registrar o motivo do fechamento da operação
 
     pairs_df = df[['ticker1', 'ticker2']].drop_duplicates()
+
+    stop_loss_amount = -total_investment * stop_loss_percentage  # Valor de perda que aciona o stop-loss
 
     for _, pair in pairs_df.iterrows():
         ticker1 = pair['ticker1']
@@ -150,7 +156,20 @@ def apply_trading(df, total_investment=10000):
 
             trade_info = open_trades.get((ticker1, ticker2), None)
 
-            if trade_info is None and row['trade_signal'] == 1 and row['beta'] > 0:
+            # Verificar se o par está no período de espera após um stop-loss
+            last_stop_loss_date = stop_loss_dates.get((ticker1, ticker2), None)
+            if last_stop_loss_date is not None:
+                days_since_stop_loss = (current_date - last_stop_loss_date).days
+            else:
+                days_since_stop_loss = None
+
+            # Determinar se podemos entrar em uma nova operação
+            can_enter_trade = False
+            if trade_info is None and row['trade_signal'] == True and row['beta'] > 0:
+                if last_stop_loss_date is None or days_since_stop_loss > cooldown_period:
+                    can_enter_trade = True
+
+            if can_enter_trade:
                 qty_long, qty_short = calculate_trade_volumes(row['price_ticker1'], row['price_ticker2'], row['beta'], total_investment)
                 df.loc[idx, 'qty_ticker1'] = qty_long
                 df.loc[idx, 'qty_ticker2'] = qty_short
@@ -172,9 +191,20 @@ def apply_trading(df, total_investment=10000):
                 )
                 df.loc[idx, 'daily_trade_return'] = unrealized_return
 
-                if trade_info['entry_residual'] * row['residual'] < 0:
+                # Verificar se o stop-loss foi atingido
+                if unrealized_return <= stop_loss_amount:
                     df.loc[idx, 'trade_return'] = unrealized_return
+                    df.loc[idx, 'trade_close_reason'] = 'Stop-Loss'
                     del open_trades[(ticker1, ticker2)]
+                    # Registrar a data do stop-loss para o período de espera
+                    stop_loss_dates[(ticker1, ticker2)] = current_date
+                # Verificar condição de fechamento normal (resíduo cruzou zero)
+                elif trade_info['entry_residual'] * row['residual'] < 0:
+                    df.loc[idx, 'trade_return'] = unrealized_return
+                    df.loc[idx, 'trade_close_reason'] = 'Resíduo Cruzou Zero'
+                    del open_trades[(ticker1, ticker2)]
+                else:
+                    df.loc[idx, 'trade_return'] = np.nan  # Operação ainda aberta
             else:
                 df.loc[idx, 'daily_trade_return'] = 0.0
 
@@ -196,7 +226,7 @@ pairs = [
     ('RADL3.SA', 'RAIL3.SA')
 ]
 
-start_date = "2019-01-01"
+start_date = "2021-01-01"
 end_date = "2024-09-30"
 
 # Passo 1: Executar a função de backtest
@@ -208,10 +238,12 @@ df_daily_statistics = run_daily_backtest_parallel(
 df_daily_statistics = rolling_ols_stats(df_daily_statistics, window_size=120)
 
 # Passo 3: Definir condições dinâmicas de entrada/saída com volatilidade ajustada
-df_daily_statistics = check_dynamic_trading_conditions(df_daily_statistics, window_size=60, k_factor=1.5)
+df_daily_statistics = check_dynamic_trading_conditions(df_daily_statistics, window_size=20, k_factor=1.5)
 
-# Passo 4: Aplicar operações de trading e calcular os retornos financeiros
-df_daily_statistics = apply_trading(df_daily_statistics, total_investment=10000)
+# Passo 4: Aplicar operações de trading e calcular os retornos financeiros com stop-loss e período de espera
+df_daily_statistics = apply_trading(
+    df_daily_statistics, total_investment=10000, stop_loss_percentage=0.05, cooldown_period=5
+)
 
 # Salvar os resultados em CSV se houver resultados
 if not df_daily_statistics.empty:
